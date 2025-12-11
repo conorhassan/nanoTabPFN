@@ -46,8 +46,8 @@ class Embedder(nn.Module):
         """Embed context (training) data. x: [B, N, C], y: [B, N] or [B, N, 1]"""
         if y.dim() == 2:
             y = y.unsqueeze(-1)
-        x_emb = self.x_embed(x.unsqueeze(-1))  # [B, N, C, D]
-        y_emb = self.y_embed(y)  # [B, N, 1, D]
+        x_emb = self.x_embed(x.unsqueeze(-1))       # [B, N, C, D]
+        y_emb = self.y_embed(y)                     # [B, N, 1, D]
         emb = x_emb.mean(dim=2) + y_emb.squeeze(2)  # [B, N, D]
         marker = self._get_marker(x.size(0), "context", x.device)
         return emb + marker
@@ -64,7 +64,7 @@ class Embedder(nn.Module):
 
     def embed_target(self, x: Tensor) -> Tensor:
         """Embed target (test) data. x: [B, T, C], no y values."""
-        x_emb = self.x_embed(x.unsqueeze(-1))  # [B, T, C, D]
+        x_emb = self.x_embed(x.unsqueeze(-1))         # [B, T, C, D]
         emb = x_emb.mean(dim=2)  # [B, T, D]
         marker = self._get_marker(x.size(0), "target", x.device)
         return emb + marker
@@ -352,7 +352,7 @@ class ARTabPFN(nn.Module):
         z, _ = self.backbone(embeddings, mask_features, mask_rows)    # [B, R, 1, D]
 
         # Extract target embeddings
-        z_target = z[:, Nc + Nb:, 0, :]  # [B, Nt, D]
+        z_target = z[:, Nc + Nb:, 0, :]                               # [B, Nt, D]
 
         # Predict
         if y_target is not None and y_target.dim() == 2:
