@@ -1,4 +1,4 @@
-"""autoregressive-nanoTabPFN: Autoregressive TabPFN with two-stage attention."""
+"""Model components for autoregressive-nanoTabPFN."""
 
 from .model import (
     ARTabPFN,
@@ -6,20 +6,15 @@ from .model import (
     TwoStageTransformer,
     TwoStageTransformerLayer,
     MixtureGaussianHead,
+)
+from .attention import (
     MultiheadAttention,
     create_dense_mask,
     create_row_mask,
     create_context_self_attention_mask,
     clear_mask_cache,
-    triton_available,
-    cross_attention,
 )
-from .data import (
-    DataAttr,
-    MLPSCM,
-    TabularSampler,
-    OnlineTabularDataset,
-)
+from .triton_kernels import triton_available, cross_attention
 
 __all__ = [
     # Model
@@ -37,9 +32,4 @@ __all__ = [
     # Triton
     'triton_available',
     'cross_attention',
-    # Data
-    'DataAttr',
-    'MLPSCM',
-    'TabularSampler',
-    'OnlineTabularDataset',
 ]

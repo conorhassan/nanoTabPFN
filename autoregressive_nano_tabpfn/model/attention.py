@@ -19,8 +19,9 @@ from torch.nn.attention.flex_attention import (
     BlockMask,
 )
 
-# Pre-compile flex_attention
-flex_attention = torch.compile(flex_attention)
+# Compile flex_attention only on CUDA (CPU doesn't support compiled flex_attention)
+if torch.cuda.is_available():
+    flex_attention = torch.compile(flex_attention)
 
 
 class MultiheadAttention(nn.Module):
