@@ -1,14 +1,14 @@
 """Training loop for ARTabPFN with online tabular data generation."""
 
 import time
-from typing import Optional, Dict, Any
+from typing import Dict
 
 import torch
 from torch.optim import AdamW
 from torch.utils.data import DataLoader
 
-from .model import ARTabPFN, create_dense_mask, create_row_mask, clear_mask_cache
-from .data import DataAttr, TabularSampler, OnlineTabularDataset
+from .model import ARTabPFN, create_dense_mask, create_row_mask
+from .data import OnlineTabularDataset
 
 
 def train(
