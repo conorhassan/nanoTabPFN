@@ -103,9 +103,9 @@ class ARTabPFNPredictor:
         # Expand for two-stage attention: [B, Nc, 1, D]
         x = ctx_emb.unsqueeze(2)
 
-        # Get masks
+        # Get masks (context uses dense self-attention, not causal)
         feature_mask = create_dense_mask(seq_len=1, device=x.device)
-        row_mask = self._create_causal_mask(Nc, device=x.device)
+        row_mask = create_dense_mask(seq_len=Nc, device=x.device)
 
         # Run through transformer layers, caching KV from row attention
         for layer in self.backbone.layers:
@@ -318,19 +318,20 @@ class ARTabPFNPredictor:
         """
         Create mask for decode step.
 
-        New tokens can attend to:
-        - All cached tokens (positions 0..num_cached-1)
-        - Themselves and earlier new tokens (causal within new)
+        Structure: [cached context] [buffer_0..buffer_{n-2}] [target]
+        - Buffers attend to: context + causal within buffers
+        - Target (last position) attends to: context + all buffers (no self-attention)
         """
         total = num_cached + num_new
 
         def decode_mod(b, h, q_idx, kv_idx):
-            # q_idx is relative to new tokens (0..num_new-1)
-            # kv_idx is absolute (0..total-1)
-            # New token at position i can attend to:
-            # - All cached: kv_idx < num_cached
-            # - Causal within new: kv_idx < num_cached + q_idx + 1
-            return kv_idx < num_cached + q_idx + 1
+            is_target = q_idx == num_new - 1
+            is_buffer = q_idx < num_new - 1
+
+            target_pattern = is_target & (kv_idx < num_cached + q_idx)
+            buffer_pattern = is_buffer & (kv_idx < num_cached + q_idx + 1)
+
+            return target_pattern | buffer_pattern
 
         return create_block_mask(
             decode_mod, B=None, H=None, Q_LEN=num_new, KV_LEN=total, device=device
