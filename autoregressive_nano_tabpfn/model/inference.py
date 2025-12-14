@@ -4,7 +4,7 @@ Autoregressive predictor for ARTabPFN with KV caching.
 Uses flex_attention for sampling and log-likelihood evaluation.
 """
 
-from typing import Optional, Tuple
+from typing import Optional
 
 import torch
 from torch import Tensor
@@ -245,74 +245,61 @@ class ARTabPFNPredictor:
         return torch.cat(predictions, dim=1)  # [B, Nt]
 
     @torch.no_grad()
-    def evaluate_log_likelihood(
+    def evaluate_joint_density(
         self,
         x_context: Tensor,
         y_context: Tensor,
         x_target: Tensor,
         y_target: Tensor,
-    ) -> Tuple[Tensor, Tensor]:
+    ) -> Tensor:
         """
-        Sample predictions AND compute log-likelihood of true targets.
-
-        Uses sampled predictions (not true values) as context for subsequent
-        predictions, matching the generative process.
-
-        Args:
-            x_context: [B, Nc, num_features] context features
-            y_context: [B, Nc] context targets
-            x_target: [B, Nt, num_features] target features
-            y_target: [B, Nt] true target values
+        Compute log-density of targets using teacher forcing (single forward pass).
 
         Returns:
-            y_pred: [B, Nt] sampled predictions
-            log_ll: [B, Nt] log-likelihood of y_target under model
+            log_density: [B, Nt] log-density of each y_target under the model
         """
-        B, Nc, num_features = x_context.shape
+        B, Nc, _ = x_context.shape
         Nt = x_target.shape[1]
         device, dtype = x_context.device, x_context.dtype
 
-        # Setup cache
-        max_seq = Nc + Nt
-        self.init_kv_cache(B, max_seq, device, dtype)
+        self.init_kv_cache(B, Nc + 2 * Nt, device, dtype)
         self.prefill_context(x_context, y_context)
 
-        # Autoregressive generation with log-likelihood evaluation
-        predictions = []
-        log_likelihoods = []
-        prev_x, prev_y = None, None
+        # Embed all buffers from (x_target, y_target) with AR position embeddings
+        buffer_emb = self.embedder.embed_buffer(x_target, y_target)
+        ar_positions = torch.arange(Nt, device=device) % self.ar_tokens.shape[0]
+        buffer_emb = buffer_emb + self.ar_tokens[ar_positions]
 
-        for t in range(Nt):
-            x_t = x_target[:, t : t + 1, :]  # [B, 1, num_features]
-            y_t_true = y_target[:, t : t + 1]  # [B, 1] true value
-            ar_idx = t % self.ar_tokens.shape[0]
+        # Embed all targets
+        target_emb = self.embedder.embed_target(x_target)
 
-            # Get embeddings and decode (same as autoregressive_decode)
-            target_emb = self.embedder.embed_target(x_t)
+        # [Buffer_0..Nt-1, Target_0..Nt-1]
+        embedding = torch.cat([buffer_emb, target_emb], dim=1)
 
-            if prev_x is not None and prev_y is not None:
-                buffer_emb = self.embedder.embed_buffer(prev_x, prev_y)
-                buffer_emb = buffer_emb + self.ar_tokens[ar_idx]
-                embedding = torch.cat([buffer_emb, target_emb], dim=1)
-                commit = 1
-            else:
-                embedding = target_emb
-                commit = 0
+        # Single forward pass with teacher forcing mask
+        z = self._teacher_forcing_decode(embedding, Nt)
 
-            z = self.transformer_decode(embedding, commit=commit)
-            z_target = z[:, -1:, :]  # [B, 1, D]
+        # Extract target representations and compute log-density
+        z_targets = z[:, Nt:, :]
+        return self.head.log_likelihood(z_targets, y_target.unsqueeze(-1))
 
-            # Compute log-likelihood of TRUE target
-            log_ll = self.head.log_likelihood(z_target, y_t_true.unsqueeze(-1))  # [B, 1]
-            log_likelihoods.append(log_ll)
+    @torch.no_grad()
+    def _teacher_forcing_decode(self, embedding: Tensor, num_targets: int) -> Tensor:
+        """Process [buffers, targets] with teacher forcing mask."""
+        B, N, D = embedding.shape
+        x = embedding.unsqueeze(2)
 
-            # Sample prediction for next context (use sampled, not true)
-            y_pred = self.head.sample(z_target)[:, :, 0, 0]  # [B, 1]
-            predictions.append(y_pred)
+        feature_mask = create_dense_mask(seq_len=1, device=x.device)
+        row_mask = self._create_teacher_forcing_mask(
+            num_cached=self.seq_len, num_targets=num_targets, device=x.device
+        )
 
-            prev_x, prev_y = x_t, y_pred
+        for layer in self.backbone.layers:
+            x = self._layer_decode_with_cache(
+                layer, x, feature_mask, row_mask, cache_start=self.seq_len
+            )
 
-        return torch.cat(predictions, dim=1), torch.cat(log_likelihoods, dim=1)
+        return self.backbone.norm(x.squeeze(2))
 
     # Internal helpers
     def _create_causal_mask(self, seq_len: int, device: torch.device) -> BlockMask:
@@ -347,6 +334,51 @@ class ARTabPFNPredictor:
 
         return create_block_mask(
             decode_mod, B=None, H=None, Q_LEN=num_new, KV_LEN=total, device=device
+        )
+
+    def _create_teacher_forcing_mask(
+        self, num_cached: int, num_targets: int, device: torch.device
+    ) -> BlockMask:
+        """
+        Create mask for batched teacher forcing evaluation.
+
+        Sequence structure for new tokens: [Buffer_0, ..., Buffer_{Nt-1}, Target_0, ..., Target_{Nt-1}]
+        - Buffers: positions [0, Nt) in new tokens
+        - Targets: positions [Nt, 2*Nt) in new tokens
+
+        Attention pattern:
+        - Buffer_i attends to: context (all), buffers [0..i] (causal)
+        - Target_i attends to: context (all), buffers [0..i-1] (strictly < i), NO other targets
+        """
+        Nt = num_targets
+        num_new = 2 * Nt
+        total = num_cached + num_new
+
+        def teacher_forcing_mod(b, h, q_idx, kv_idx):
+            # q_idx in [0, 2*Nt): [0, Nt) are buffers, [Nt, 2*Nt) are targets
+            # kv_idx in [0, num_cached + 2*Nt)
+
+            # Everyone attends to context
+            attends_context = kv_idx < num_cached
+
+            # Buffer queries (q_idx < Nt): causal within buffers
+            is_buffer_query = q_idx < Nt
+            buffer_start = num_cached
+            kv_is_buffer = (kv_idx >= buffer_start) & (kv_idx < buffer_start + Nt)
+            buffer_kv_idx = kv_idx - buffer_start  # Which buffer position
+            buffer_causal = kv_is_buffer & (buffer_kv_idx <= q_idx)
+
+            # Target queries (q_idx >= Nt): attend to buffers [0, target_idx)
+            is_target_query = q_idx >= Nt
+            target_idx = q_idx - Nt  # Which target (0..Nt-1)
+            # Target_i attends to Buffer_j where j < i (strictly less than)
+            target_to_buffer = kv_is_buffer & (buffer_kv_idx < target_idx)
+
+            # Combine: buffers use buffer_causal, targets use target_to_buffer
+            return attends_context | (is_buffer_query & buffer_causal) | (is_target_query & target_to_buffer)
+
+        return create_block_mask(
+            teacher_forcing_mod, B=None, H=None, Q_LEN=num_new, KV_LEN=total, device=device
         )
 
     def _layer_forward_with_cache(
